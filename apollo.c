@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <stddef.h>
 #include <stdint.h>
 #include <malloc.h>
@@ -41,6 +43,7 @@
 struct apollo_ctx {
 	int config_status;
 	int config_cache;
+	unsigned config_max_content_length;
 
 	const char *namespace;
 	const char *appId;
@@ -78,6 +81,8 @@ struct apollo_ctx * Apollo_ctx_create(const char *namespace, const char *appId, 
 	ctx->namespace = namespace;
 	ctx->appId = appId;
 	ctx->cluster = cluster;
+	ctx->config_status = APOLLO_CONFIG_BEGIN;
+	ctx->config_max_content_length = UINT16_MAX;
 
 	return ctx;
 }
@@ -86,6 +91,7 @@ void Apollo_ctx_free(struct apollo_ctx * ctx)
 {
 	FREE(ctx->current_resp_string);
 	FREE(ctx->current_config_string);
+
 	cJSON_Delete(ctx->json);
 	FREE(ctx);
 }
@@ -139,18 +145,12 @@ int Apollo_server_config_launch(struct apollo_ctx * ctx)
 	cJSON *json;
 
 	switch (ctx->config_status) {
-		case APOLLO_CONFIG_BEGIN:
-			return -ENODATA;
-		case APOLLO_CONFIG_READBODY:
-		case APOLLO_CONFIG_READHEADER:
-			return EAGAIN;
-		case APOLLO_CONFIG_BAD:
-			return EBADMSG;
 		case APOLLO_CONFIG_LAUNCHED:
 			goto launch;
 		case APOLLO_CONFIG_READED:
-		default:
 			break;
+		default:
+			return ctx->config_status;
 	}
 
 	// cleanup old config json object
@@ -189,11 +189,11 @@ launch:
 	}
 
 	ctx->config_status = APOLLO_CONFIG_LAUNCHED;
-	return 0;
+	return APOLLO_CONFIG_LAUNCHED;
 
 msg_bad:
-	ctx->config_status = APOLLO_CONFIG_BAD;
-	return EBADMSG;
+	ctx->config_status = APOLLO_CONFIG_MSGBAD;
+	return APOLLO_CONFIG_MSGBAD;
 }
 
 char * Apollo_server_config_request(struct apollo_ctx *ctx)
@@ -240,7 +240,7 @@ char * Apollo_server_config_request(struct apollo_ctx *ctx)
 
 
 //[chunk_length][CRLF][chunk_data[CRLF].....[0][CRLF][footer][CRLF]
-static int __apollo_read_server_resp_body (struct apollo_ctx *ctx) {
+static int __apollo_read_server_trunk_resp_body (struct apollo_ctx *ctx) {
 	char *chunk_data;
 	char *body, *end;
 	int chunk_length;
@@ -269,8 +269,8 @@ begin:
 		chunk_data = body;
 	}
 
-	if (chunk_length >= UINT16_MAX) {
-		return APOLLO_CONFIG_BAD;
+	if (chunk_length + ctx->current_config_len > ctx->config_max_content_length) {
+		return APOLLO_CONFIG_MSGTOOLANG;
 	} else if (chunk_length == 0) {
 		return APOLLO_CONFIG_READED;
 	}
@@ -285,9 +285,11 @@ begin:
 	if (ctx->config_buffer_total_len - ctx->current_config_len <= ctx->chunk_length) {
 		char *new_string = calloc(1, ctx->current_config_len + ctx->chunk_length + 1);
 		if (!new_string) {
-			return APOLLO_CONFIG_BAD;
+			return APOLLO_CONFIG_NOMEM;
 		}
-		memcpy(new_string, ctx->current_config_string, ctx->current_config_len);
+		if (ctx->current_config_len > 0) {
+			memcpy(new_string, ctx->current_config_string, ctx->current_config_len);
+		}
 		FREE(ctx->current_config_string);
 		ctx->current_config_string = new_string;
 	}
@@ -303,7 +305,47 @@ begin:
 		goto begin;
 	}
 
-	return 0;
+	return APOLLO_CONFIG_READBODY;
+}
+
+static int __apollo_read_server_normal_resp_read (struct apollo_ctx *ctx)
+{
+	unsigned content_length;
+	char *header, *value, *end;
+
+	if (ctx->config_status != APOLLO_CONFIG_READBODY) {
+		header = strcasestr(ctx->current_resp_string, "Content-Length:");
+		if (!header) {
+			return APOLLO_CONFIG_NOLEN;
+		}
+
+		end = ctx->current_resp_string + ctx->len;
+		header += sizeof("Content-Length:") - 1;
+
+		if (header >= end) {
+			return APOLLO_CONFIG_HTTPBADMSG;
+		}
+		content_length = strtol(header, &value, 10);
+		if (content_length == 0 || value >= end) {
+			return APOLLO_CONFIG_HTTPBADMSG;
+		}
+
+		if (content_length > ctx->config_max_content_length) {
+			return APOLLO_CONFIG_MSGTOOLANG;
+		}
+		ctx->current_config_len = content_length;
+	}
+
+	if (ctx->len - ctx->body_offset < ctx->current_config_len) {
+		return APOLLO_CONFIG_READBODY;
+	}
+
+	ctx->current_config_string = strdup(ctx->current_resp_string + ctx->body_offset);
+	if (!ctx->current_config_string) {
+		return APOLLO_CONFIG_NOMEM;
+	}
+
+	return APOLLO_CONFIG_READED;
 }
 
 static int __apollo_read_server_resp_header (struct apollo_ctx *ctx) {
@@ -315,7 +357,11 @@ static int __apollo_read_server_resp_header (struct apollo_ctx *ctx) {
 	}
 	ctx->body_offset = body + 2*HTTP_TOK_LEN - ctx->current_resp_string;
 
-	return __apollo_read_server_resp_body(ctx);
+	if (ctx->config_cache) {
+		return __apollo_read_server_normal_resp_read(ctx);
+	}
+
+	return __apollo_read_server_trunk_resp_body(ctx);
 }
 
 int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len, int reread)
@@ -326,21 +372,20 @@ int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len, 
 		ctx->config_status = APOLLO_CONFIG_BEGIN;
 	}
 
-	if (ctx->config_status == APOLLO_CONFIG_BAD
-		|| ctx->config_status == APOLLO_CONFIG_READED
-		|| ctx->config_status == APOLLO_CONFIG_LAUNCHED) {
+	if (ctx->config_status < APOLLO_CONFIG_BEGIN
+		|| ctx->config_status > APOLLO_CONFIG_READBODY) {
 		return ctx->config_status;
 	}
 
 	if (ctx->config_status == APOLLO_CONFIG_BEGIN) {
 		// free old config string
-		FREE(ctx->current_resp_string);
-		FREE(ctx->current_config_string);
+		FREE_PTR(ctx->current_resp_string);
+		FREE_PTR(ctx->current_config_string);
 
 		ctx->len = 0;
 		ctx->current_resp_string = malloc(len+1);
 		if (!ctx->current_resp_string) {
-			return ENOMEM;
+			return APOLLO_CONFIG_NOMEM;
 		}
 		memcpy(ctx->current_resp_string, buffer, len);
 		ctx->current_resp_string[len] = '\0';
@@ -352,12 +397,12 @@ int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len, 
 	} else {
 		resp = calloc(1, ctx->len + len + 1);
 		if (!resp) {
-			return ENOMEM;
+			return APOLLO_CONFIG_NOMEM;
 		}
 
 		memcpy(resp, ctx->current_resp_string, ctx->len);
 		memcpy(resp, ctx->current_resp_string+ctx->len, len);
-		FREE(ctx->current_resp_string);
+		FREE_PTR(ctx->current_resp_string);
 		ctx->current_resp_string = resp;
 		ctx->len += len;
 		ctx->current_resp_string[ctx->len] = '\0';
@@ -366,8 +411,44 @@ int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len, 
 	if (ctx->config_status == APOLLO_CONFIG_READHEADER) {
 		ctx->config_status = __apollo_read_server_resp_header(ctx);
 	} else {
-		ctx->config_status = __apollo_read_server_resp_body(ctx);
+		if (ctx->config_cache) {
+			ctx->config_status = __apollo_read_server_normal_resp_read(ctx);
+		} else {
+			ctx->config_status = __apollo_read_server_trunk_resp_body(ctx);
+		}
 	}
 
 	return ctx->config_status;
+}
+
+unsigned Apollo_set_server_max_config_length(struct apollo_ctx *ctx, unsigned len)
+{
+	unsigned old_len;
+
+	old_len = ctx->config_max_content_length;
+
+	ctx->config_max_content_length = len;
+
+	return old_len;
+}
+
+int Apollo_set_server_req_cache (struct apollo_ctx *ctx, int req_cache)
+{
+	int old_cache;
+
+	old_cache = ctx->config_cache;
+
+	ctx->config_cache = req_cache;
+
+	return old_cache;
+}
+
+const char * Apollo_get_last_resp_string (struct apollo_ctx *ctx)
+{
+	return (const char *)ctx->current_resp_string;
+}
+
+const char * Apollo_get_last_config_string (struct apollo_ctx *ctx)
+{
+	return (const char *)ctx->current_config_string;
 }
