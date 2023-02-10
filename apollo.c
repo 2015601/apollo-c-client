@@ -348,7 +348,7 @@ static int __apollo_read_server_normal_resp_read (struct apollo_ctx *ctx)
 	if (ctx->config_status != APOLLO_CONFIG_READBODY) {
 		header = strcasestr(ctx->current_resp_string, "Content-Length:");
 		if (!header) {
-			return APOLLO_CONFIG_NOLEN;
+			return APOLLO_CONFIG_NOMSGLEN;
 		}
 
 		end = ctx->current_resp_string + ctx->len;
