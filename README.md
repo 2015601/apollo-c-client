@@ -1,3 +1,3 @@
 ### Apollo C Client
 
-Apollo c language client library.
+携程apollo c语言配置客户端库

@@ -18,26 +18,28 @@
 #include "apollo.h"
 
 #define HTTP_TOK_LEN (sizeof("\r\n")-1)
+#define HTTP_OK 200
+#define HTTP_CODE_MIN 100
 
 #define FREE_PTR(ptr) do { \
-	if (ptr) {			   \
-		free(ptr);		   \
-		ptr = NULL;		   \
-	}					   \
+	if (ptr) {             \
+		free(ptr);         \
+		ptr = NULL;        \
+	}                      \
 } while(0)
 #define FREE(ptr) do { \
-	if (ptr) {		   \
-		free(ptr);	   \
-	}				   \
+	if (ptr) {         \
+		free(ptr);     \
+	}                  \
 } while(0)
 
 #define cjson_object_walk(json, item) \
 	for(item = json->child; item; item = item->next)
 
 #define CALL(func, ...) ({ \
-	if (func) {			   \
+	if (func) {            \
 		func(__VA_ARGS__); \
-	}					   \
+	}                      \
 })
 
 struct apollo_ctx {
@@ -57,6 +59,7 @@ struct apollo_ctx {
 	};
 
 	struct {
+		char *last_releaseKey;
 		char *current_config_string;
 		int current_config_len;
 		int config_buffer_total_len;
@@ -91,6 +94,7 @@ void Apollo_ctx_free(struct apollo_ctx * ctx)
 {
 	FREE(ctx->current_resp_string);
 	FREE(ctx->current_config_string);
+	FREE(ctx->last_releaseKey);
 
 	cJSON_Delete(ctx->json);
 	FREE(ctx);
@@ -142,7 +146,7 @@ static int __apollo_config_item_check (struct apollo_ctx *ctx, const char *name,
 
 int Apollo_server_config_launch(struct apollo_ctx * ctx)
 {
-	cJSON *json;
+	cJSON *json, *releaseKey;
 
 	switch (ctx->config_status) {
 		case APOLLO_CONFIG_LAUNCHED:
@@ -166,6 +170,12 @@ int Apollo_server_config_launch(struct apollo_ctx * ctx)
 	if (ctx->config_cache) {
 		ctx->json = json;
 	} else {
+		FREE_PTR(ctx->last_releaseKey);
+		releaseKey = cJSON_GetObjectItem(json, "releaseKey");
+		if (cJSON_IsString(releaseKey)) {
+			ctx->last_releaseKey = strdup(releaseKey->valuestring);
+		}
+
 		ctx->json = cJSON_DetachItemFromObject(json, "configurations");
 		cJSON_Delete(json);
 	}
@@ -196,25 +206,45 @@ msg_bad:
 	return APOLLO_CONFIG_MSGBAD;
 }
 
-char * Apollo_server_config_request(struct apollo_ctx *ctx)
+char * Apollo_server_config_request_gen(struct apollo_ctx *ctx, const char *releaseKey, const char *IP, int http_keepalived)
 {
 	const char *apollo_http_request =
-	"GET /configfiles/json/%s/%s/%s HTTP/1.1\r\n"
+	"GET /configfiles/json/%s/%s/%s%s HTTP/1.1\r\n"
 	"Host: apollo-server\r\n"
 	"User-Agent: apollo-c-client/1.0\r\n"
-	"Connection: close\r\n"
+	"Connection: %s\r\n"
 	"Accept: */*\r\n\r\n";
 	const char *apollo_http_no_cache_request =
-	"GET /configs/%s/%s/%s HTTP/1.1\r\n"
+	"GET /configs/%s/%s/%s%s HTTP/1.1\r\n"
 	"Host: apollo-server\r\n"
 	"User-Agent: apollo-c-client/1.0\r\n"
-	"Connection: close\r\n"
+	"Connection: %s\r\n"
 	"Accept: */*\r\n\r\n";
 	size_t req_length;
 	char *req_buffer;
+	char req_arg[1024];
+
+	if (releaseKey && IP && !ctx->config_cache) {
+		req_length = sizeof("?releaseKey=&ip=") - 1 + strlen(IP) + strlen(releaseKey);
+		snprintf(req_arg, sizeof(req_arg), "?releaseKey=%s&ip=%s", releaseKey, IP);
+	} else if (IP) {
+		req_length = sizeof("?ip=") - 1 + + strlen(IP);
+		snprintf(req_arg, sizeof(req_arg), "?ip=%s", IP);
+	} else if (releaseKey && !ctx->config_cache) {
+		req_length = sizeof("?releaseKey=") - 1 + strlen(releaseKey);
+		snprintf(req_arg, sizeof(req_arg), "?releaseKey=%s", releaseKey);
+	} else {
+		req_length = 0;
+		req_arg[0] = '\0';
+	}
+	if (http_keepalived) {
+		req_length += sizeof("keep-alive");
+	} else {
+		req_length += sizeof("close");
+	}
 
 	if (ctx->config_cache) {
-		req_length = strlen(apollo_http_request)
+		req_length += strlen(apollo_http_request)
 			+ strlen(ctx->appId)
 			+ strlen(ctx->cluster)
 			+ strlen(ctx->namespace) + 4;
@@ -222,9 +252,10 @@ char * Apollo_server_config_request(struct apollo_ctx *ctx)
 		if (!req_buffer) {
 			return NULL;
 		}
-		snprintf(req_buffer, req_length, apollo_http_request, ctx->appId, ctx->cluster, ctx->namespace);
+		snprintf(req_buffer, req_length, apollo_http_request, ctx->appId,
+			ctx->cluster, ctx->namespace, req_arg, http_keepalived ? "keep-alive" : "close");
 	} else {
-		req_length = strlen(apollo_http_no_cache_request)
+		req_length += strlen(apollo_http_no_cache_request)
 			+ strlen(ctx->appId)
 			+ strlen(ctx->cluster)
 			+ strlen(ctx->namespace) + 4;
@@ -232,7 +263,8 @@ char * Apollo_server_config_request(struct apollo_ctx *ctx)
 		if (!req_buffer) {
 			return NULL;
 		}
-		snprintf(req_buffer, req_length, apollo_http_no_cache_request, ctx->appId, ctx->cluster, ctx->namespace);
+		snprintf(req_buffer, req_length, apollo_http_no_cache_request, ctx->appId,
+			ctx->cluster, ctx->namespace, req_arg, http_keepalived ? "keep-alive" : "close");
 	}
 
 	return req_buffer;
@@ -349,12 +381,28 @@ static int __apollo_read_server_normal_resp_read (struct apollo_ctx *ctx)
 }
 
 static int __apollo_read_server_resp_header (struct apollo_ctx *ctx) {
-	char *body;
+	char *body, *header;
+	int resp_code;
 
 	body = strstr(ctx->current_resp_string, "\r\n\r\n");
 	if (!body) {
 		return APOLLO_CONFIG_READHEADER;
 	}
+
+	header = strstr(ctx->current_resp_string, "HTTP/1.");
+	if (!header) {
+		return APOLLO_CONFIG_HTTPBADHEADER;
+	}
+
+	header += sizeof("HTTP/1.") /* +1-1 = 0*/;
+	resp_code = strtol(header, NULL, 10);
+	if (resp_code < HTTP_CODE_MIN) {
+		return APOLLO_CONFIG_HTTPBADHEADER;
+	}
+	if (resp_code != HTTP_OK) {
+		return resp_code;
+	}
+
 	ctx->body_offset = body + 2*HTTP_TOK_LEN - ctx->current_resp_string;
 
 	if (ctx->config_cache) {
@@ -364,13 +412,9 @@ static int __apollo_read_server_resp_header (struct apollo_ctx *ctx) {
 	return __apollo_read_server_trunk_resp_body(ctx);
 }
 
-int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len, int reread)
+int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len)
 {
 	char *resp;
-
-	if (reread) {
-		ctx->config_status = APOLLO_CONFIG_BEGIN;
-	}
 
 	if (ctx->config_status < APOLLO_CONFIG_BEGIN
 		|| ctx->config_status > APOLLO_CONFIG_READBODY) {
@@ -401,7 +445,7 @@ int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len, 
 		}
 
 		memcpy(resp, ctx->current_resp_string, ctx->len);
-		memcpy(resp, ctx->current_resp_string+ctx->len, len);
+		memcpy(resp+ctx->len, buffer, len);
 		FREE_PTR(ctx->current_resp_string);
 		ctx->current_resp_string = resp;
 		ctx->len += len;
@@ -452,3 +496,51 @@ const char * Apollo_get_last_config_string (struct apollo_ctx *ctx)
 {
 	return (const char *)ctx->current_config_string;
 }
+
+const char * Apollo_get_last_releaseKey (struct apollo_ctx *ctx)
+{
+	return ctx->last_releaseKey;
+}
+
+int Apollo_config_reset_status(struct apollo_ctx *ctx)
+{
+	int old = ctx->config_status;
+
+	ctx->config_status = APOLLO_CONFIG_BEGIN;
+
+	return old;
+}
+
+int Apollo_config_reset_all(struct apollo_ctx *ctx)
+{
+	int old = ctx->config_status;
+
+	ctx->config_status = APOLLO_CONFIG_BEGIN;
+	FREE_PTR(ctx->last_releaseKey);
+	FREE_PTR(ctx->current_config_string);
+	FREE_PTR(ctx->current_resp_string);
+
+	return old;
+}
+
+int Apollo_config_reset_releaseKey(struct apollo_ctx *ctx)
+{
+	FREE_PTR(ctx->last_releaseKey);
+
+	return ctx->config_status;
+}
+int Apollo_config_reset_config(struct apollo_ctx *ctx)
+{
+	FREE_PTR(ctx->current_config_string);
+	FREE_PTR(ctx->current_resp_string);
+
+	return ctx->config_status;
+}
+
+
+_APOLLO_CTX_SET_DEFINE(namespace)
+_APOLLO_CTX_SET_DEFINE(appId)
+_APOLLO_CTX_SET_DEFINE(cluster)
+_APOLLO_CTX_GET_DEFINE(namespace)
+_APOLLO_CTX_GET_DEFINE(appId)
+_APOLLO_CTX_GET_DEFINE(cluster)
