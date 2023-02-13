@@ -340,7 +340,7 @@ begin:
 	return APOLLO_CONFIG_READBODY;
 }
 
-static int __apollo_read_server_normal_resp_read (struct apollo_ctx *ctx)
+static int __apollo_read_server_normal_resp_body (struct apollo_ctx *ctx)
 {
 	unsigned content_length;
 	char *header, *value, *end;
@@ -406,7 +406,7 @@ static int __apollo_read_server_resp_header (struct apollo_ctx *ctx) {
 	ctx->body_offset = body + 2*HTTP_TOK_LEN - ctx->current_resp_string;
 
 	if (ctx->config_cache) {
-		return __apollo_read_server_normal_resp_read(ctx);
+		return __apollo_read_server_normal_resp_body(ctx);
 	}
 
 	return __apollo_read_server_trunk_resp_body(ctx);
@@ -456,7 +456,7 @@ int Apollo_server_response_read (struct apollo_ctx *ctx, char *buffer, int len)
 		ctx->config_status = __apollo_read_server_resp_header(ctx);
 	} else {
 		if (ctx->config_cache) {
-			ctx->config_status = __apollo_read_server_normal_resp_read(ctx);
+			ctx->config_status = __apollo_read_server_normal_resp_body(ctx);
 		} else {
 			ctx->config_status = __apollo_read_server_trunk_resp_body(ctx);
 		}
@@ -519,6 +519,8 @@ int Apollo_config_reset_all(struct apollo_ctx *ctx)
 	FREE_PTR(ctx->last_releaseKey);
 	FREE_PTR(ctx->current_config_string);
 	FREE_PTR(ctx->current_resp_string);
+	cJSON_Delete(ctx->json);
+	ctx->json = NULL;
 
 	return old;
 }
